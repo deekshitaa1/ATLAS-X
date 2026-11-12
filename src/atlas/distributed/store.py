@@ -62,28 +62,59 @@ class DistributedStore:
             if node not in self._nodes:
                 raise KeyError(node)
 
-            self.registry.mark_recovered(node)
             repaired = 0
+            keys = self._all_known_keys()
 
-            for key, value in list(self._nodes[node].items()):
+            for key in keys:
                 replicas = self.manager.get_replicas(key)
-                available = [
+                if node not in replicas:
+                    continue
+
+                available_sources = [
                     replica for replica in replicas
-                    if self.registry.is_available(replica)
+                    if replica != node
+                    and self.registry.is_available(replica)
+                    and key in self._nodes[replica]
                 ]
-                if available:
-                    for replica in available:
-                        self._nodes[replica][key] = value
 
-            for key in self._all_known_keys():
-                replicas = self.manager.get_replicas(key)
-                if node in replicas and key not in self._nodes[node]:
-                    for replica in replicas:
-                        if replica != node and key in self._nodes[replica]:
-                            self._nodes[node][key] = self._nodes[replica][key]
-                            repaired += 1
-                            break
+                if not available_sources:
+                    continue
 
+                values = [
+                    self._nodes[replica][key]
+                    for replica in available_sources
+                ]
+
+                versioned = [
+                    value for value in values
+                    if isinstance(value, VersionedValue)
+                ]
+
+                if versioned:
+                    if len(versioned) != len(values):
+                        continue
+                    selected = max(versioned, key=lambda entry: entry.version)
+                    self._version_clock.observe(selected.version)
+                else:
+                    selected = values[0]
+
+                if self._nodes[node].get(key) != selected:
+                    self._nodes[node][key] = selected
+                    repaired += 1
+
+                for replica in available_sources:
+                    current = self._nodes[replica][key]
+
+                    if isinstance(selected, VersionedValue):
+                        if (
+                            not isinstance(current, VersionedValue)
+                            or current.version < selected.version
+                        ):
+                            self._nodes[replica][key] = selected
+                    elif current == selected:
+                        continue
+
+            self.registry.mark_recovered(node)
             return repaired
 
     def _all_known_keys(self) -> set[str]:
@@ -111,27 +142,40 @@ class DistributedStore:
                 return []
 
             checker = ConsistencyChecker()
-            outliers = checker.find_outliers(values)
+            digests = {
+                node: checker._digest(value)
+                for node, value in values.items()
+            }
 
-            if not outliers:
-                return []
-
-            counts = {}
-            for value in values.values():
-                digest = checker._digest(value)
+            counts: dict[str, int] = {}
+            for digest in digests.values():
                 counts[digest] = counts.get(digest, 0) + 1
 
-            majority_digest = max(counts, key=counts.get)
+            highest_count = max(counts.values())
+            winners = [
+                digest for digest, count in counts.items()
+                if count == highest_count
+            ]
+
+            if len(winners) != 1 or highest_count <= len(values) // 2:
+                return []
+
+            majority_digest = winners[0]
             majority_value = next(
-                value for value in values.values()
-                if checker._digest(value) == majority_digest
+                values[node]
+                for node in values
+                if digests[node] == majority_digest
             )
+
+            outliers = [
+                node for node, digest in digests.items()
+                if digest != majority_digest
+            ]
 
             for node in outliers:
                 self._nodes[node][key] = majority_value
 
             return outliers
-
 
     def quorum_put(self, key: str, value: Any, config) -> list[str]:
         replicas = self.manager.get_replicas(key)
@@ -144,15 +188,26 @@ class DistributedStore:
         ]
 
         with self._lock:
-            written = []
-            for node in available:
-                self._nodes[node][key] = value
-                written.append(node)
-
-            if len(written) < config.write_quorum:
+            if len(available) < config.write_quorum:
                 raise RuntimeError("Write quorum not reached")
 
-            return written
+            previous = {
+                node: (key in self._nodes[node], self._nodes[node].get(key))
+                for node in available
+            }
+
+            try:
+                for node in available:
+                    self._nodes[node][key] = value
+            except Exception:
+                for node, (existed, old_value) in previous.items():
+                    if existed:
+                        self._nodes[node][key] = old_value
+                    else:
+                        self._nodes[node].pop(key, None)
+                raise
+
+            return available
 
     def quorum_get(self, key: str, config) -> Any:
         replicas = self.manager.get_replicas(key)
@@ -170,8 +225,17 @@ class DistributedStore:
             if len(values) < config.read_quorum:
                 raise RuntimeError("Read quorum not reached")
 
-            return values[0]
+            versioned = [
+                value for value in values
+                if isinstance(value, VersionedValue)
+            ]
 
+            if versioned:
+                if len(versioned) != len(values):
+                    raise RuntimeError("Mixed versioned and unversioned replicas")
+                return max(versioned, key=lambda entry: entry.version)
+
+            return values[0]
 
     def versioned_put(self, key: str, value: Any) -> VersionedValue:
         replicas = self.manager.get_replicas(key)
@@ -190,10 +254,7 @@ class DistributedStore:
                 if key in self._nodes[node]
                 and isinstance(self._nodes[node][key], VersionedValue)
             ]
-            current = max(current_versions, default=0)
-            self._version_clock._version = max(
-                self._version_clock.current, current
-            )
+            self._version_clock.observe(max(current_versions, default=0))
             entry = VersionedValue(self._version_clock.next_version(), value)
 
             for node in available:
