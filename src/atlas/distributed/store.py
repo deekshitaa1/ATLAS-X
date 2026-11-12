@@ -91,6 +91,45 @@ class DistributedStore:
             for key in data
         }
 
+
+    def repair_inconsistent_replicas(self, key: str) -> list[str]:
+        from atlas.distributed.consistency import ConsistencyChecker
+
+        replicas = self.manager.get_replicas(key)
+
+        with self._lock:
+            values = {
+                node: self._nodes[node][key]
+                for node in replicas
+                if self.registry.is_available(node)
+                and key in self._nodes[node]
+            }
+
+            if len(values) < 2:
+                return []
+
+            checker = ConsistencyChecker()
+            outliers = checker.find_outliers(values)
+
+            if not outliers:
+                return []
+
+            counts = {}
+            for value in values.values():
+                digest = checker._digest(value)
+                counts[digest] = counts.get(digest, 0) + 1
+
+            majority_digest = max(counts, key=counts.get)
+            majority_value = next(
+                value for value in values.values()
+                if checker._digest(value) == majority_digest
+            )
+
+            for node in outliers:
+                self._nodes[node][key] = majority_value
+
+            return outliers
+
     def get_node_data(self, node: str) -> dict[str, Any]:
         with self._lock:
             if node not in self._nodes:
