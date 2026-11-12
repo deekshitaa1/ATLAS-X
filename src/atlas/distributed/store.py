@@ -130,6 +130,46 @@ class DistributedStore:
 
             return outliers
 
+
+    def quorum_put(self, key: str, value: Any, config) -> list[str]:
+        replicas = self.manager.get_replicas(key)
+        if len(replicas) < config.replicas:
+            raise RuntimeError("Insufficient configured replicas")
+
+        available = [
+            node for node in replicas
+            if self.registry.is_available(node)
+        ]
+
+        with self._lock:
+            written = []
+            for node in available:
+                self._nodes[node][key] = value
+                written.append(node)
+
+            if len(written) < config.write_quorum:
+                raise RuntimeError("Write quorum not reached")
+
+            return written
+
+    def quorum_get(self, key: str, config) -> Any:
+        replicas = self.manager.get_replicas(key)
+        if len(replicas) < config.replicas:
+            raise RuntimeError("Insufficient configured replicas")
+
+        with self._lock:
+            values = [
+                self._nodes[node][key]
+                for node in replicas
+                if self.registry.is_available(node)
+                and key in self._nodes[node]
+            ]
+
+            if len(values) < config.read_quorum:
+                raise RuntimeError("Read quorum not reached")
+
+            return values[0]
+
     def get_node_data(self, node: str) -> dict[str, Any]:
         with self._lock:
             if node not in self._nodes:
