@@ -5,6 +5,7 @@ from typing import Any
 
 from atlas.distributed.node_registry import NodeRegistry
 from atlas.distributed.replication import ReplicationManager
+from atlas.distributed.versioning import VersionClock, VersionedValue
 
 
 class DistributedStore:
@@ -16,6 +17,7 @@ class DistributedStore:
             node: {} for node in manager.ring.get_nodes()
         }
         self.registry = NodeRegistry(list(self._nodes))
+        self._version_clock = VersionClock()
         self._lock = threading.RLock()
 
     def put(self, key: str, value: Any) -> list[str]:
@@ -169,6 +171,51 @@ class DistributedStore:
                 raise RuntimeError("Read quorum not reached")
 
             return values[0]
+
+
+    def versioned_put(self, key: str, value: Any) -> VersionedValue:
+        replicas = self.manager.get_replicas(key)
+        available = [
+            node for node in replicas
+            if self.registry.is_available(node)
+        ]
+
+        if not available:
+            raise RuntimeError("No available replicas")
+
+        with self._lock:
+            current_versions = [
+                self._nodes[node][key].version
+                for node in replicas
+                if key in self._nodes[node]
+                and isinstance(self._nodes[node][key], VersionedValue)
+            ]
+            current = max(current_versions, default=0)
+            self._version_clock._version = max(
+                self._version_clock.current, current
+            )
+            entry = VersionedValue(self._version_clock.next_version(), value)
+
+            for node in available:
+                self._nodes[node][key] = entry
+
+            return entry
+
+    def versioned_get(self, key: str) -> VersionedValue:
+        replicas = self.manager.get_replicas(key)
+
+        with self._lock:
+            entries = [
+                self._nodes[node][key]
+                for node in replicas
+                if self.registry.is_available(node)
+                and isinstance(self._nodes[node].get(key), VersionedValue)
+            ]
+
+            if not entries:
+                raise KeyError(key)
+
+            return max(entries, key=lambda entry: entry.version)
 
     def get_node_data(self, node: str) -> dict[str, Any]:
         with self._lock:
