@@ -39,3 +39,26 @@ Run:
     python benchmarks/compare_wal_sync.py
 
     python benchmarks/benchmark_atlas.py
+
+## Latest Storage Engine Benchmark
+
+Date: 2026-11-12
+
+Single run using `benchmark_atlas.py`:
+- Durable writes: 250 operations
+- Write throughput: 1,397.69 ops/sec
+- Write P50: 0.5990 ms
+- Write P95: 1.1416 ms
+- Write P99: 1.7931 ms
+- Write mean latency: 0.7155 ms
+- Reads: 1,000 operations
+- Read throughput: 468,318.18 ops/sec
+- Read P50: 0.0021 ms
+- Read P95: 0.0022 ms
+- Read P99: 0.0028 ms
+- Read mean latency: 0.0021 ms
+- Scan: 250 records in 0.2015 ms
+
+Note: These are single-run local measurements. They are not directly
+comparable to the three-run WAL sync comparison above. Repeat runs and
+additional workloads are required for reliable performance conclusions.
